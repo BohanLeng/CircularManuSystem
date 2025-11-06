@@ -179,7 +179,7 @@ class SensorReader:
                 time.sleep(debounce) # Wait for debouncing in case of flickering
                 if self.read_pi(pin): # Check if the sensor is still triggered
                     return True # Count it as a real trigger
-            time.sleep(0.01) # Small delay to not overwhelm CPU
+            time.sleep(0.01) # Small delay for better performance
         return False
 
     def wait_for_mcp(self, name, timeout=10, debounce=0.05):
