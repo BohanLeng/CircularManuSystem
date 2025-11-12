@@ -249,24 +249,39 @@ class StationController:
         exit_sensor = (self.sensors.station1_exit if self.station_num == 1
                        else self.sensors.station2_exit)
 
+        sensor_cleared = False  # Track if the sensor actually cleared
+
         while time.time() - start_time < timeout:
             if not exit_sensor():  # Sensor cleared
                 time.sleep(0.5)  # Brief extra time to ensure part is fully clear
+                sensor_cleared = True # Update sensor cleared flag
                 break
             time.sleep(0.1)
 
         self.motors.stop(self.motor_num)
 
-        # Log EXIT event
-        if self.current_part:
-            self.data_logger.log_event(
-                self.current_part.part_id,
-                self.station_id,
-                "EXIT"
-            )
-            self.current_part.add_event(self.station_id, "EXIT")
-            self.logger.info(f"Part {self.current_part.get_short_id()} completed")
+        if sensor_cleared:
+            # Part cleared the sensor - log and finish
+            if self.current_part:
+                self.data_logger.log_event(
+                    self.current_part.part_id,
+                    self.station_id,
+                    "EXIT"
+                )
+                self.current_part.add_event(self.station_id, "EXIT")
+                self.logger.info(f"Part {self.current_part.get_short_id()} completed")
 
-        # Reset the station
-        self.current_part = None
-        self.state = StationState.IDLE
+            # Reset the station
+            self.current_part = None
+            self.state = StationState.IDLE
+        else:
+            # Sensor didn't clear - Jam Detection
+            self.logger.critical(f"JAM DETECTED at {self.station_id} exit! Part stuck on sensor.")
+            if self.current_part:
+                self.data_logger.log_event(
+                    self.current_part.part_id,
+                    self.station_id,
+                    "ERROR_JAM_EXIT"
+                )
+            # Stop the station thread - manual intervention required
+            self.running = False
