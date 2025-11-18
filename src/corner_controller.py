@@ -1,12 +1,12 @@
 """
-Corner Controller
-Manages corner transfers with pusher mechanism
+Corner Controller Passive Finite State Machine (FSM) Architecture
+Event driven state machine for corner transfers
 """
 
 import logging
 import time
-from enum import Enum  # For defining corner states as a list of named constants
-from threading import Thread, Event
+from enum import Enum
+from threading import Timer
 
 
 class CornerState(Enum):
@@ -22,16 +22,20 @@ class CornerState(Enum):
 
 class CornerController:
     """
-    Controls a single corner transfer
+    Passive Corner Controller FSM
 
-    State machine:
-    IDLE to FINAL_APPROACH to READY_TO_PUSH to EXTENDING to PUSHING
-    to WAITING_FOR_CONFIRMATION to RETRACTING back to IDLE
+    Responds to events from CEP Consumer
+    Handles pusher mechanism and collision avoidance
     """
 
-    def __init__(self, corner_num, motors, sensors, collision_mgr, config):
+    def __init__(self, corner_num, motors, collision_mgr, config):
         """
         Initialize corner controller
+
+        corner_num: Corner number (1-4)
+        motors: MotorController instance
+        collision_mgr: CollisionManager instance
+        config: Configuration dictionary
         """
         self.logger = logging.getLogger(f"Corner{corner_num}")
         self.corner_num = corner_num
@@ -39,10 +43,9 @@ class CornerController:
 
         # References to subsystems
         self.motors = motors
-        self.sensors = sensors
         self.collision_mgr = collision_mgr
 
-        # Load settings from config
+        # Configuration
         self.config = config
         self.push_speed = config['motors']['corner_speed']
         self.extend_time = config['corners']['extend_time']
@@ -50,263 +53,242 @@ class CornerController:
         self.final_delay = config['corners']['final_approach_delay']
         self.handshake_timeout = config['corners']['handshake_timeout']
 
-        # Circular Flow: C1 is fed by M1, C3 is fed by M2 , C2 and C4 are fed by the stations
-        self.is_fed_by_main_conveyor = self.corner_num in [1, 3]
-        self.feed_motor_num = 1 if self.corner_num == 1 else (2 if self.corner_num == 3 else None)
+        # Motor assignment
+        self.motor_num = 4 + corner_num
+
+        # Conveyor management
+        self.is_fed_by_main_conveyor = corner_num in [1, 3]
+        self.feed_motor_num = 1 if corner_num == 1 else (2 if corner_num == 3 else None)
         self.conveyor_speed = config['motors']['conveyor_speed']
 
-        # Defines the "confirmation" sensor for each corner's push
-        # (e.g. C1 pushes to S1, so it waits for the S1_ENTRY sensor)
+        # Confirmation sensor mapping
         self.confirmation_sensor = {
-            1: ('station', 1),  # 1 = Station 1
-            2: ('main_conveyor', 1),  # 1 = M1
-            3: ('station', 2),  # 2 = Station 2
-            4: ('main_conveyor', 2)  # 2 = M2
-        }.get(self.corner_num)
-
-        # Assign motor number (Motors 5-8 for Corners 1-4)
-        self.motor_num = 4 + corner_num
+            1: 'S1_ENTRY',
+            2: 'M1_START',
+            3: 'S2_ENTRY',
+            4: 'M2_START'
+        }.get(corner_num)
 
         # State machine
         self.state = CornerState.IDLE
 
-        # Thread control
-        self.running = False
-        self.stop_event = Event()
-        self.thread = None
+        # Timers
+        self.approach_timer = None
+        self.handshake_timer = None
 
-        self.logger.info(f"Corner {corner_num} initialized")
-
-    def _stop_feed_conveyor(self):
-        """Stops the main conveyor (M1/M2) that feeds this corner, if applicable."""
-        if self.is_fed_by_main_conveyor:
-            self.logger.info(f"Stopping main conveyor (Motor {self.feed_motor_num})")
-            self.motors.stop(self.feed_motor_num)
-
-    def _start_feed_conveyor(self):
-        """Starts the main conveyor (M1/M2) that feeds this corner, if applicable."""
-        if self.is_fed_by_main_conveyor:
-            self.logger.info(f"Restarting main conveyor (Motor {self.feed_motor_num})")
-            self.motors.set_speed(self.feed_motor_num, self.conveyor_speed)
-
-    def start(self):
-        """Start corner control thread"""
-        # Check if already running
-        if self.running:
-            self.logger.warning(f"Corner {self.corner_num} already running")
-            return
-
-        if self.state != CornerState.IDLE:
-            self.logger.error(f"Cannot start corner {self.corner_num} - not in IDLE state (current: {self.state})")
-            return
-
-        # Start the feed conveyor for corners C1 and C3
+        # Conveyor control
         if self.is_fed_by_main_conveyor:
             self._start_feed_conveyor()
 
-        self.running = True
-        self.stop_event.clear()
-        self.thread = Thread(target=self._run, daemon=True)
-        self.thread.start()
-        self.logger.info(f"Corner {self.corner_num} started")
+        self.logger.info(f"Corner {corner_num} initialized (passive FSM)")
 
-    def stop(self):
-        """Stop corner control thread"""
-        if not self.running:
+    def process_event(self, event):
+        """
+        Process an event from CEP Consumer
+        Looks at the current state and routes to the correct handler
+
+        Event format:
+        {
+            'timestamp' ,
+            'barrier_id' ,
+            'part_id' ,
+            'location_type' ,
+            'location_id'
+        }
+        """
+        barrier_id = event['barrier_id']
+        timestamp = event['timestamp']
+
+        self.logger.debug(f"Event: {barrier_id}, State: {self.state.value}")
+
+        # State machine
+        if self.state == CornerState.IDLE:
+            self._handle_idle(event)
+
+        elif self.state == CornerState.FINAL_APPROACH:
+            self._handle_final_approach(event)
+
+        elif self.state == CornerState.READY_TO_PUSH:
+            self._handle_ready_to_push(event)
+
+        elif self.state == CornerState.EXTENDING:
+            self._handle_extending(event)
+
+        elif self.state == CornerState.PUSHING:
+            self._handle_pushing(event)
+
+        elif self.state == CornerState.WAITING_FOR_CONFIRMATION:
+            self._handle_waiting_for_confirmation(event)
+
+        elif self.state == CornerState.RETRACTING:
+            self._handle_retracting(event)
+
+    def _handle_idle(self, event):
+        """Handle events in IDLE state"""
+        barrier_id = event['barrier_id']
+
+        # Only accept corner position sensor
+        if barrier_id != f'C{self.corner_num}_POS':
             return
 
-        self.running = False
-        self.stop_event.set()
-        if self.thread:
-            self.thread.join(timeout=2)
-        self.motors.stop(self.motor_num)
-        self.logger.info(f"Corner {self.corner_num} stopped")
+        self.logger.info("Part detected at corner sensor")
 
-    def _run(self):
-        """Main corner control loop"""
-        while self.running and not self.stop_event.is_set():
-            try:
-                # State machine
-                if self.state == CornerState.IDLE:
-                    self._state_idle()
-
-                elif self.state == CornerState.FINAL_APPROACH:
-                    self._state_final_approach()
-
-                elif self.state == CornerState.READY_TO_PUSH:
-                    self._state_ready_to_push()
-
-                elif self.state == CornerState.EXTENDING:
-                    self._state_extending()
-
-                elif self.state == CornerState.PUSHING:
-                    self._state_pushing()
-
-                elif self.state == CornerState.WAITING_FOR_CONFIRMATION:
-                    self._state_waiting_for_confirmation()
-
-                elif self.state == CornerState.RETRACTING:
-                    self._state_retracting()
-
-                time.sleep(0.05)  # Small delay
-
-            except Exception as e:
-                self.logger.error(f"Error in control loop: {e}", exc_info=True)
-                self.motors.stop(self.motor_num)
-                time.sleep(1)
-
-    def _state_idle(self):
-        """Idle state - waiting for part at the 'corner_pos' sensor"""
-        # Check the 'corner_pos' sensor
-        if self.sensors.corner_pos(self.corner_num):
-            self.logger.info("Part detected at corner sensor.")
-
-            if self.is_fed_by_main_conveyor:
-                # Check if the conveyor is busy
-                if self.collision_mgr.is_conveyor_safe_to_stop(self.feed_motor_num):
-                    # If it's safe, stop the conveyor and proceed.
-                    self._stop_feed_conveyor()
-                    self.state = CornerState.FINAL_APPROACH
-                else:
-                    # Conveyor is busy, wait and check again.
-                    self.logger.debug("Part detected, but conveyor is busy. Waiting...")
-                    time.sleep(0.1)
-            else:
-                # Not fed by main conveyor (C2, C4), always safe to proceed.
-                self.state = CornerState.FINAL_APPROACH
-
-    def _state_final_approach(self):
-        """Part is at 'corner_pos' sensor. Wait for a short delay."""
-
-        # Wait for the part to travel the last distance
-        self.logger.debug(f"Waiting {self.final_delay}s for final approach...")
-        time.sleep(self.final_delay)
-        self.logger.info("Final approach complete. Part is in position.")
-        self.state = CornerState.READY_TO_PUSH
-
-    def _state_ready_to_push(self):
-        """Ready to push - check for collisions"""
-        # Atomically check and "reserve" the corner
-        if self.collision_mgr.request_corner(self.corner_num):
-            self.logger.info("Safe to push, corner reserved.")
-            self.state = CornerState.EXTENDING
-        else:
-            self.logger.debug("Waiting for safe conditions...")
-            time.sleep(0.2)  # If not safe wait and try again on the next loop
-
-    def _state_extending(self):
-        """Extending pusher"""
-        self.logger.info("Extending pusher...")
-
-        # Ensure fully retracted first
-        if not self.sensors.corner_retracted(self.corner_num):
-            self.logger.warning("Pusher not retracted - forcing retraction")
-            if not self._force_retract():
-                # Retract failed, stop the thread
-                self.logger.critical(f"Corner {self.corner_num} failed to retract. Assuming it is stuck!")
-                self._stop_feed_conveyor()  # Stop conveyor to prevent more parts
-                self.running = False
+        # Check if conveyor is safe to stop
+        if self.is_fed_by_main_conveyor:
+            if not self.collision_mgr.is_conveyor_safe_to_stop(self.feed_motor_num):
+                self.logger.debug("Conveyor busy, waiting...")
                 return
 
-        # Extend pusher
+            # Stop conveyor
+            self._stop_feed_conveyor()
+
+        # Start final approach timer
+        self.approach_timer = Timer(self.final_delay, self._final_approach_complete)
+        self.approach_timer.start()
+
+        self.state = CornerState.FINAL_APPROACH
+
+    def _handle_final_approach(self, event):
+        """Handle events in FINAL_APPROACH state"""
+        # Ignore jitter
+        pass
+
+    def _final_approach_complete(self):
+        """Called when final approach timer expires"""
+        self.logger.info("Final approach complete, part in position")
+        self.state = CornerState.READY_TO_PUSH
+
+        # Try to reserve corner
+        self._try_push()
+
+    def _try_push(self):
+        """Try to reserve corner and start push"""
+        if self.collision_mgr.request_corner(self.corner_num):
+            self.logger.info("Corner reserved, starting push")
+            self.state = CornerState.EXTENDING
+            self._extend_pusher()
+        else:
+            # Not safe yet, try again later
+            Timer(0.2, self._try_push).start()
+
+    def _handle_ready_to_push(self, event):
+        """Handle events in READY_TO_PUSH state"""
+        # Waiting for collision clearance
+        pass
+
+    def _extend_pusher(self):
+        """Extend the pusher"""
+        self.logger.info("Extending pusher...")
         self.motors.set_speed(self.motor_num, self.push_speed)
+        # we'll get CORNER_EXT event when limit switch is hit
+
+    def _handle_extending(self, event):
+        """Handle events in EXTENDING state"""
+        barrier_id = event['barrier_id']
 
         # Wait for extended limit switch
-        if not self.sensors.wait_for_mcp(f'CORNER{self.corner_num}_EXT', timeout=self.extend_time * 2):
-            self.logger.error("Timeout extending pusher")
+        if barrier_id == f'CORNER{self.corner_num}_EXT':  # Extended limit switch hit
             self.motors.stop(self.motor_num)
-            self.collision_mgr.release_corner(self.corner_num)
-            # Stop conveyor on error and go to IDLE
-            self._stop_feed_conveyor()
-            self.running = False  # Stop the thread
-            return
+            self.logger.info("Pusher extended")
+            self.state = CornerState.PUSHING
 
-        self.motors.stop(self.motor_num)
-        self.logger.info("Pusher extended")
-        self.state = CornerState.PUSHING
+            # Set handshake wait flag
+            self.collision_mgr.set_handshake_wait(self.corner_num)
 
-    def _state_pushing(self):
-        """Pusher is extended, part is pushed. Move to wait for confirmation."""
-        # Simple check if the part is still on the sensor. If so, print a warning.
-        if self.sensors.corner_pos(self.corner_num):
-            self.logger.critical(f"JAM DETECTED! Part stuck on sensor at corner {self.corner_num}.")
-            self.collision_mgr.clear_handshake_wait(self.corner_num)  # Clear handshake wait
-            self.running = False  # Stop the thread
-        else:
-            # Part has moved off the sensor, now wait for it to arrive at the next one
+            # Start handshake timer
+            self.handshake_timer = Timer(
+                self.handshake_timeout,
+                self._handshake_timeout
+            )
+            self.handshake_timer.start()
+
             self.state = CornerState.WAITING_FOR_CONFIRMATION
 
-    def _state_waiting_for_confirmation(self):
-        """Wait for the part to be confirmed at the next sensor after push"""
-        self.logger.debug(f"Waiting for push confirmation (timeout={self.handshake_timeout}s)...")
-        self.collision_mgr.set_handshake_wait(self.corner_num)  # Set handshake wait
+    def _handle_pushing(self, event):
+        """Handle events in PUSHING state"""
+        # Transition happens via timer
+        pass
 
-        # Add a safety check
-        if not self.confirmation_sensor:
-            self.logger.error(f"No confirmation sensor defined for corner {self.corner_num}")
+    def _handle_waiting_for_confirmation(self, event):
+        """Handle events in WAITING_FOR_CONFIRMATION state"""
+        barrier_id = event['barrier_id']
+
+        # Check for confirmation sensor
+        if barrier_id == self.confirmation_sensor:
+            # Handshake received
+            if self.handshake_timer:
+                self.handshake_timer.cancel()
+
+            self.logger.info("Push confirmed by next sensor")
             self.collision_mgr.clear_handshake_wait(self.corner_num)
-            self.running = False
-            return
 
-        # Determine which sensor to wait for
-        sensor_type, sensor_ref_id = self.confirmation_sensor
-        push_success = False
-        # Wait for confirmation from the appropriate sensor
-        if sensor_type == 'station':
-            push_success = self.sensors.wait_for_station_entry(sensor_ref_id, timeout=self.handshake_timeout)
-        elif sensor_type == 'main_conveyor':
-            push_success = self.sensors.wait_for_main_conveyor_start(sensor_ref_id, timeout=self.handshake_timeout)
-
-        if push_success:
-            # Confirmation received, proceed to retract
-            self.logger.info("Push confirmed by next sensor.")
+            # Start retraction
             self.state = CornerState.RETRACTING
-        else:
-            # Timeout waiting for confirmation - JAM detected
-            self.logger.critical(f"JAM DETECTED! Part never arrived at next sensor for corner {self.corner_num}.")
-            self.collision_mgr.clear_handshake_wait(self.corner_num)
-            self.running = False  # Stop the thread
+            self._retract_pusher()
 
-    def _state_retracting(self):
-        """Retracting pusher"""
-        self.logger.info("Retracting pusher...")
-
-        # No longer waiting for the handshake in any case
+    def _handshake_timeout(self):
+        """Called when handshake timer expires (jam scenario)"""
+        self.logger.critical(f"JAM DETECTED! Part never arrived at next sensor")
         self.collision_mgr.clear_handshake_wait(self.corner_num)
 
-        # Check if the retract was successful
-        success = self._force_retract()
+        # Keep corner locked, don't release
+        # Manual intervention required
+        self.logger.critical("Corner locked, manual intervention required")
 
-        if success:
-            # Release the lock only on successful retraction
-            self.collision_mgr.release_corner(self.corner_num)
-            self.state = CornerState.IDLE
-            # Restart conveyor to resume operations
-            self._start_feed_conveyor()
-        else:
-            # The corner and adjacent corners are now locked until manual intervention
-            self.logger.critical(f"Corner {self.corner_num} failed to retract. Assuming it is stuck!")
-            self.logger.critical(f"Corner {self.corner_num} and adjacent corners are locked.")
-            self.logger.critical(f"Manual intervention required , use the recovery file to reset the corner states.")
-
-            # Stop the feed conveyor to prevent more parts from arriving
-            self._stop_feed_conveyor()
-
-            # Stop this thread - no automatic recovery
-            self.running = False
-
-    def _force_retract(self):
-        """Helper function to retract motor until switch is hit"""
+    def _retract_pusher(self):
+        """Retract the pusher"""
+        self.logger.info("Retracting pusher...")
         self.motors.set_speed(self.motor_num, -self.push_speed)
 
+        # Will get CORNER_RET event when limit switch is hit
+
+    def _handle_retracting(self, event):
+        """Handle events in RETRACTING state"""
+        barrier_id = event['barrier_id']
+
         # Wait for retracted limit switch
-        success = self.sensors.wait_for_mcp(f'CORNER{self.corner_num}_RET', timeout=self.retract_time * 2)
+        if barrier_id == f'CORNER{self.corner_num}_RET':
+            self.motors.stop(self.motor_num)
+            self.logger.info("Pusher retracted")
 
-        if not success:
-            self.logger.error("Timeout retracting pusher")
-            self.motors.stop(self.motor_num)  # Stop motor on failure
-            return False
+            # Release corner
+            self.collision_mgr.release_corner(self.corner_num)
 
+            # Restart conveyor
+            self._start_feed_conveyor()
+
+            # Return to IDLE
+            self.state = CornerState.IDLE
+            self.logger.info("Corner ready for next part")
+
+    def _start_feed_conveyor(self):
+        """Start the main conveyor that feeds this corner"""
+        if self.is_fed_by_main_conveyor:
+            self.logger.debug(f"Starting conveyor M{self.feed_motor_num}")
+            self.motors.set_speed(self.feed_motor_num, self.conveyor_speed)
+
+    def _stop_feed_conveyor(self):
+        """Stop the main conveyor that feeds this corner"""
+        if self.is_fed_by_main_conveyor:
+            self.logger.debug(f"Stopping conveyor M{self.feed_motor_num}")
+            self.motors.stop(self.feed_motor_num)
+
+    def stop(self):
+        """Stop the corner controller"""
+        # Cancel any active timers
+        if self.approach_timer and self.approach_timer.is_alive():
+            self.approach_timer.cancel()
+        if self.handshake_timer and self.handshake_timer.is_alive():
+            self.handshake_timer.cancel()
+
+        # Stop motor
         self.motors.stop(self.motor_num)
-        self.logger.info("Pusher retracted")
-        return True
+
+        self.logger.info(f"Corner {self.corner_num} stopped")
+
+    def get_status(self):
+        """Get current corner status"""
+        return {
+            'corner_id': self.corner_id,
+            'state': self.state.value
+        }
