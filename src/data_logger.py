@@ -78,28 +78,34 @@ class DataLogger:
         """Create CSV file with headers"""
         with open(self.log_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Time', 'Station ID', 'Part ID', 'Activity'])
+            writer.writerow(['Time', 'Station ID', 'Part ID', 'Activity', 'Tag'])
         self.logger.info("Created new event log file")
 
-    def log_event(self, part_id, station_id, activity):
+    def log_event(self, part_id, station_id, activity, tag=None):
         """
-        Log an event
+        Log an event with START/FINISH tag
             part_id: Part ID (e.g., "P001", "04a1b2c3d4e5f6")
 
             station_id: Station ID (e.g., "S1", "S2", "C1", "C2", "C3", "C4")
 
-            activity: Activity type (e.g., "ENTER", "EXIT", "PROCESS")
+            activity: Activity type (e.g., "ENTER", "EXIT", "PROCESS_START", "PROCESS_END")
+
+            tag: Event tag - "START" or "FINISH" (auto-inferred if None)
 
         """
         # Get current timestamp
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         current_time = time.time()
 
+        # Auto-infer tag if not provided
+        if tag is None:
+            tag = self._infer_tag(activity)
+
         with self.lock:
-            # Write to CSV
+            # Write to CSV with tag
             with open(self.log_file, 'a', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow([timestamp, station_id, part_id, activity])
+                writer.writerow([timestamp, station_id, part_id, activity, tag])
 
             # Log to console
             self.logger.info(f"Event: {timestamp} | {station_id} | {part_id} | {activity}")
@@ -122,6 +128,24 @@ class DataLogger:
                     activity=activity,
                     additional_fields={'cycle_time': cycle_time} if cycle_time else None
                 )
+
+    def _infer_tag(self, activity):
+        """
+        Automatically infer START/FINISH tag from activity name
+
+        FINISH activities: EXIT, COMPLETE, END, FINISH
+        START activities: Everything else (ENTER, PROCESS_START, PUSH_START, etc.)
+
+        Returns: 'START' or 'FINISH'
+        """
+        finish_keywords = ['EXIT', 'COMPLETE', 'END', 'FINISH']
+
+        activity_upper = activity.upper()
+        for keyword in finish_keywords:
+            if keyword in activity_upper:
+                return 'FINISH'
+
+        return 'START'
 
     def _update_kpis(self, station_id, activity):
         """Update KPI counters"""
