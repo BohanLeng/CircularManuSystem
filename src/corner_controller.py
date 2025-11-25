@@ -28,13 +28,14 @@ class CornerController:
     Handles pusher mechanism and collision avoidance
     """
 
-    def __init__(self, corner_num, motors, collision_mgr, config):
+    def __init__(self, corner_num, motors, collision_mgr, data_logger, config):
         """
         Initialize corner controller
 
         corner_num: Corner number (1-4)
         motors: MotorController instance
         collision_mgr: CollisionManager instance
+        data_logger: DataLogger instance for logging push activities
         config: Configuration dictionary
         """
         self.logger = logging.getLogger(f"Corner{corner_num}")
@@ -44,6 +45,7 @@ class CornerController:
         # References to subsystems
         self.motors = motors
         self.collision_mgr = collision_mgr
+        self.data_logger = data_logger
 
         # Configuration
         self.config = config
@@ -194,6 +196,15 @@ class CornerController:
     def _extend_pusher(self):
         """Extend the pusher"""
         self.logger.info("Extending pusher...")
+
+        # Log PUSH_START activity
+        self.data_logger.log_event(
+            part_id='UNKNOWN',  # Corners don't track specific part IDs
+            station_id=self.corner_id,
+            activity='PUSH_START',
+            tag='START'
+        )
+
         self.motors.set_speed(self.motor_num, self.push_speed)
         # we'll get CORNER_EXT event when limit switch is hit
 
@@ -265,6 +276,14 @@ class CornerController:
         if barrier_id == f'CORNER{self.corner_num}_RET':
             self.motors.stop(self.motor_num)
             self.logger.info("Pusher retracted")
+
+            # Log PUSH_COMPLETE activity
+            self.data_logger.log_event(
+                part_id='UNKNOWN',
+                station_id=self.corner_id,
+                activity='PUSH_COMPLETE',
+                tag='FINISH'
+            )
 
             # Release corner
             self.collision_mgr.release_corner(self.corner_num)
