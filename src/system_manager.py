@@ -136,6 +136,7 @@ class SystemManager:
                 corner_num=i,
                 motors=self.motors,
                 collision_mgr=self.collision_mgr,
+                data_logger=self.data_logger,  # Pass data_logger for activity logging
                 config=self.config
             )
             self.corners.append(corner)
