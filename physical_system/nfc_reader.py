@@ -11,7 +11,9 @@ from threading import Thread, Lock, Event
 try:
     import board
     import busio
+    import digitalio
     from adafruit_pn532.spi import PN532_SPI
+    from adafruit_pn532.i2c import PN532_I2C
     HARDWARE_AVAILABLE = True
 except (ImportError, NotImplementedError):
     HARDWARE_AVAILABLE = False
@@ -42,7 +44,7 @@ class NFCReaderThread(Thread):
         self.station_id = station_id
         self.nfc_queue = nfc_queue
         self.simulation = simulation or not HARDWARE_AVAILABLE
-
+        
         # Thread control
         self.running = False
         self.stop_event = Event()
@@ -62,26 +64,33 @@ class NFCReaderThread(Thread):
         try:
             # Initialize SPI
             spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
+            # Initialize I2C
+            i2c = busio.I2C(board.SCL, board.SDA)
 
-            # Select chip enable based on reader number
+            # Select reader enable based on reader number(1 for SPI, 2 for I2C)
             if self.reader_num == 1:
-                cs_pin = board.CE0 # Chip Enable 0
+                spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
+                cs_pin = digitalio.DigitalInOut(board.D8) # Chip Enable 0
             elif self.reader_num == 2:
-                cs_pin = board.CE1 # Chip Enable 1
+                i2c = busio.I2C(board.SCL, board.SDA)
             else:
-                raise ValueError("reader_num must be 1 or 2")
+                raise ValueError("reader_num must be 1(SPI) or 2(I2C)")
 
             # Initialize PN532
-            self.pn532 = PN532_SPI(spi, cs_pin, debug=False)
-            self.pn532.SAM_configuration()
-
-            self.logger.info(f"NFC Reader {self.reader_num} initialized on CE{self.reader_num-1}")
+            if self.reader_num == 1:
+                self.pn532 = PN532_SPI(spi, cs_pin, debug=False)
+                self.pn532.SAM_configuration()
+                self.logger.info(f"NFC Reader {self.reader_num} initialized on SPI mode: CE0")
+            elif self.reader_num == 2:
+                self.pn532 = PN532_I2C(i2c, debug=False)
+                self.pn532.SAM_configuration()
+                self.logger.info(f"NFC Reader {self.reader_num} initialized on I2C mode")
 
         except Exception as e:
             self.logger.error(f"Failed to initialize: {e}")
             self.logger.error("Falling back to simulation mode")
             self.simulation = True
-
+            
     def run(self):
         """Main thread loop - continuously scans for NFC tags"""
         self.running = True
@@ -154,8 +163,8 @@ class NFCReaderThread(Thread):
         self.logger.info(f"Stopping NFC Reader {self.reader_num}...")
         self.running = False
         self.stop_event.set()
-
-
+        
+        
 class Part:
     """
     Represents a part being tracked through the system
